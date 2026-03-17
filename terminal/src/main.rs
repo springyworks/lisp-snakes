@@ -297,7 +297,7 @@ fn main() -> Result<()> {
         if show_help {
             lisp_snakes_core::sim::render_help_overlay(
                 &mut out, tw, th, paused, fps, output_mode, list_view, learning_enabled,
-                alive, total, frame, sim.total_meetings, cached_loss,
+                alive, total, frame, sim.total_meetings, cached_loss, &cached_weights,
             );
         }
 

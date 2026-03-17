@@ -307,9 +307,10 @@ pub fn start() {
         }
 
         if show_help {
+            let weights = a.learner.weights.clone();
             lisp_snakes_core::sim::render_help_overlay(
                 &mut out, tw, th, paused, 8, output_mode, list_view, learning_enabled,
-                alive, total, frame, total_meetings, last_loss,
+                alive, total, frame, total_meetings, last_loss, &weights,
             );
         }
 

@@ -681,7 +681,7 @@ pub fn render_help_overlay(
     out: &mut String, tw: usize, th: usize,
     paused: bool, fps: u64, output_mode: u8, list_view: bool,
     learning_enabled: bool, alive: usize, total: usize,
-    frame: u64, meetings: u64, loss: f32,
+    frame: u64, meetings: u64, loss: f32, weights: &[f32],
 ) {
     const W: usize = 44;
     let hr = format!("\u{250c}{}\u{2510}", "\u{2500}".repeat(W));
@@ -726,8 +726,65 @@ pub fn render_help_overlay(
         row(&format!("  meetings {meetings}  loss {loss:.4}")),
         row("  meeting (dist\u{2264}2) \u{2192} lisp eats lisp"),
         row("  ml learns continuously via burn."),
-        hr_bot,
+        hr_mid.clone(),
+        row("  burn learned weights [8\u{00d7}3 linear]:"),
     ];
+
+    let mut lines = lines;
+
+    // Feature names and weight interpretation
+    const FEAT: [&str; 8] = [
+        "sin(x)", "cos(y)", "dir.dx", "dir.dy",
+        "trail", "social", "lisp", "energy",
+    ];
+    const OUT: [&str; 3] = ["dx", "dy", "mood"];
+
+    if weights.len() == FEATURE_DIM * OUTPUT_DIM {
+        // Find strongest influences per output
+        for o in 0..OUTPUT_DIM {
+            let mut pairs: Vec<(f32, &str)> = (0..FEATURE_DIM)
+                .map(|f| (weights[f * OUTPUT_DIM + o], FEAT[f]))
+                .collect();
+            pairs.sort_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap());
+            // Show top 2 influences
+            let top = &pairs[..2.min(pairs.len())];
+            let desc: String = top.iter().map(|(w, name)| {
+                let sign = if *w > 0.0 { "+" } else { "\u{2212}" };
+                format!("{sign}{:.2} {name}", w.abs())
+            }).collect::<Vec<_>>().join("  ");
+            lines.push(row(&format!("  {}: {desc}", OUT[o])));
+        }
+
+        // Overall behavior summary
+        let social_dx = weights[5 * OUTPUT_DIM];      // social → dx
+        let social_dy = weights[5 * OUTPUT_DIM + 1];   // social → dy
+        let energy_mood = weights[7 * OUTPUT_DIM + 2];  // energy → mood
+        let trail_dx = weights[4 * OUTPUT_DIM];         // trail → dx
+        let lisp_mood = weights[6 * OUTPUT_DIM + 2];    // lisp → mood
+
+        let social_str = if social_dx.abs() + social_dy.abs() > 0.3 {
+            if social_dx + social_dy > 0.0 { "seeks company" } else { "avoids crowds" }
+        } else { "indifferent to others" };
+
+        let energy_str = if energy_mood.abs() > 0.2 {
+            if energy_mood > 0.0 { "energy \u{2192} happy" } else { "energy \u{2192} anxious" }
+        } else { "energy \u{2260} mood" };
+
+        let trail_str = if trail_dx.abs() > 0.2 {
+            if trail_dx > 0.0 { "follows trails" } else { "avoids trails" }
+        } else { "ignores trails" };
+
+        let lisp_str = if lisp_mood.abs() > 0.15 {
+            if lisp_mood > 0.0 { "lisp lifts mood" } else { "lisp darkens mood" }
+        } else { "lisp \u{2260} mood" };
+
+        lines.push(row(&format!("  \u{2192} {social_str}, {energy_str}")));
+        lines.push(row(&format!("  \u{2192} {trail_str}, {lisp_str}")));
+    } else {
+        lines.push(row("  (no weights yet)"));
+    }
+
+    lines.push(hr_bot);
 
     let box_w = lines[0].chars().count();
     let box_h = lines.len();
