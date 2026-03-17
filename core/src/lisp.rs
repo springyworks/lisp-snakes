@@ -465,37 +465,100 @@ pub fn extract_comments(src: &str) -> Vec<String> {
         .collect()
 }
 
+// ── hardwired Lisp kernel ─────────────────────────────────────────────────────
+
+/// The kernel is evaluated once when a snake is born, defining utility functions
+/// in its persistent `Env`. Personality code (snippets) can call these.
+/// This is the "brainstem" — instincts that don't change, even when
+/// Lisp-eats-Lisp recombines the personality layer.
+pub const KERNEL: &str = r#"
+(begin
+  ; clamp a value to 0..1
+  (define (clamp01 v) (clamp v 0 1))
+
+  ; normalise a value from 0..max into 0..1
+  (define (norm v lo hi)
+    (clamp01 (/ (- v lo) (+ (- hi lo) 0.001))))
+
+  ; sigmoid squash — keeps outputs smooth
+  (define (squash v) (/ 1 (+ 1 (exp (- v)))))
+
+  ; safe division — never divide by zero
+  (define (safe/ a b) (if (< (abs b) 0.001) 0 (/ a b)))
+
+  ; energy urgency — high when energy is low
+  (define (urgency) (- 1 (clamp01 e)))
+
+  ; am I old?
+  (define (elder?) (> age 200))
+
+  ; mood descriptor for println
+  (define (mood-word)
+    (if (> mood 0.7) "happy"
+      (if (< mood 0.3) "grim" "calm")))
+
+  ; energy status word
+  (define (energy-word)
+    (if (> e 0.8) "strong"
+      (if (< e 0.3) "fading" "okay")))
+
+  ; standard status report — call from personality code
+  (define (status)
+    (println (mood-word) (energy-word)))
+
+  ; weighted average — useful for blending decisions
+  (define (mix a b t) (+ (* a (- 1 t)) (* b t)))
+
+  ; approach/avoid score based on distance
+  (define (approach-score)
+    (if (< d 2) 1.5 (if (< d 5) 0.5 -0.5)))
+
+  ; pulse — oscillates with age, useful for rhythm
+  (define (pulse freq) (sin (* age freq 0.01)))
+
+  nil)
+"#;
+
+/// Boot the kernel into a fresh Env.  Called once per snake at birth.
+pub fn boot_kernel(env: &mut Env) {
+    let mut budget: usize = 500;
+    let mut print_buf = Vec::new();
+    if let Ok(ast) = parse(KERNEL) {
+        let _ = eval(&ast, env, &mut budget, &mut print_buf);
+    }
+}
+
 // ── Lisp code snippets for snakes ────────────────────────────────────────────
 
 pub const SNIPPETS: &[&str] = &[
-    // 0 – the optimist
-    "; the optimist\n(begin\n  (if (> mood 0.7) (println \"everything is wonderful!\")\n    (if (< mood 0.3) (println \"even now, I believe\")\n      (println \"not bad, not bad\")))\n  (if (> e 0.5) (println \"feeling strong\") (println \"still here\"))\n  (+ e 1))",
+    // 0 – the optimist (uses kernel: status, urgency)
+    "; the optimist\n(begin\n  (status)\n  (if (> mood 0.7) (println \"everything is wonderful!\")\n    (println \"even now, I believe\"))\n  (- 1 (urgency)))",
     // 1 – the coward
     "; the coward\n(begin\n  (if (< mood 0.3) (println \"I am terrified\")\n    (if (> mood 0.7) (println \"maybe it is safe...\")\n      (println \"nervous...\")))\n  (if (> d 3) (println \"too far, I run\") (println \"oh no, so close!\"))\n  (if (> d 3) 1 -1))",
-    // 2 – the monk
-    "; the monk\n(begin\n  (if (> mood 0.7) (println \"inner peace achieved\")\n    (if (< mood 0.3) (println \"I must meditate deeper\")\n      (println \"balance in all things\")))\n  (if (< e 0.5) (println \"I accept loss\") (println \"I share abundance\"))\n  (* e 0.5))",
+    // 2 – the monk (uses kernel: status, squash, mix)
+    "; the monk\n(begin\n  (status)\n  (println \"balance in all things\")\n  (mix e oe (squash mood)))",
     // 3 – the taxman
     "; the taxman\n(begin\n  (if (> mood 0.7) (println \"revenues are up!\")\n    (if (< mood 0.3) (println \"austerity measures...\")\n      (println \"paying my dues\")))\n  (if (> d 5) (println \"distance is costly\"))\n  (- e (/ d 10)))",
     // 4 – the gambler
     "; the gambler\n(begin\n  (if (> mood 0.7) (println \"I am on a hot streak!\")\n    (if (< mood 0.3) (println \"the house always wins\")\n      (println \"playing it safe\")))\n  (if (< e 0.3) (println \"all in!\") (println \"holding cards\"))\n  (if (< e 0.3) -1 1))",
-    // 5 – the diplomat
-    "; the diplomat\n(begin\n  (if (> mood 0.7) (println \"a fine accord!\")\n    (if (< mood 0.3) (println \"talks have broken down\")\n      (println \"let us negotiate\")))\n  (if (< d 2) (println \"we can work together\"))\n  (/ e (+ d 1)))",
+    // 5 – the diplomat (uses kernel: approach-score, status)
+    "; the diplomat\n(begin\n  (status)\n  (if (> (approach-score) 0) (println \"we can work together\")\n    (println \"let us negotiate\"))\n  (safe/ e (+ d 1)))",
     // 6 – the gardener
     "; the gardener\n(begin\n  (if (> mood 0.7) (println \"the garden is paradise!\")\n    (if (< mood 0.3) (println \"weeds everywhere...\")\n      (println \"tending my garden\")))\n  (if (> e 0.6) (println \"blooming nicely\") (println \"needs more rain\"))\n  (* (+ e 1) 0.8))",
     // 7 – the magnet
     "; the magnet\n(begin\n  (if (> mood 0.7) (println \"the attraction is electric!\")\n    (if (< mood 0.3) (println \"repelling everything\")\n      (println \"searching for company\")))\n  (if (< d 2) (println \"come closer\"))\n  (if (< d 2) 2 -2))",
-    // 8 – the warrior
-    "; the warrior\n(begin\n  (if (> mood 0.7) (println \"VICTORY IS MINE!\")\n    (if (< mood 0.3) (println \"wounded but fighting\")\n      (println \"holding the line\")))\n  (println \"forward!\")\n  (- (* e 2) d))",
+    // 8 – the warrior (uses kernel: urgency, approach-score)
+    "; the warrior\n(begin\n  (println (mood-word) \"in battle\")\n  (if (> (urgency) 0.5) (println \"wounded but fighting\")\n    (println \"FORWARD!\"))\n  (+ (approach-score) (* e 2)))",
     // 9 – the dreamer
     "; the dreamer\n(begin\n  (if (> mood 0.7)\n    (begin (println \"I see the stars\") (println \"anything is possible\"))\n    (if (< mood 0.3) (println \"nightmares haunt me\")\n      (println \"waiting for dawn\")))\n  (if (> e 0.7) 3 0))",
     // 10 – the cartographer
     "; the cartographer\n(begin\n  (if (> mood 0.7) (println \"discovered new lands!\")\n    (if (< mood 0.3) (println \"lost in the fog\")\n      (println \"mapping the world\")))\n  (println (if (> d 5) \"uncharted territory\" \"known ground\"))\n  (+ e (* d 0.1)))",
-    // 11 – the poet
-    "; the poet\n(begin\n  (if (> mood 0.7) (println \"my verse soars!\")\n    (if (< mood 0.3) (println \"the muse has left me\")\n      (println \"I ride the sine wave\")))\n  (if (> (sin e) 0) (println \"rising verse\") (println \"falling refrain\"))\n  (* (sin e) d))",
+    // 11 – the poet (uses kernel: pulse, status)
+    "; the poet\n(begin\n  (status)\n  (if (> (pulse 7) 0) (println \"rising verse\") (println \"falling refrain\"))\n  (* (pulse 7) d))",
     // 12 – the rival
     "; the rival\n(begin\n  (if (> mood 0.7) (println \"I am supreme!\")\n    (if (< mood 0.3) (println \"they mock me\")\n      (println \"the contest continues\")))\n  (if (> oe e) (println \"I must retreat\") (println \"I press forward\"))\n  (if (> oe e) -1 1))",
-    // 13 – the communist
-    "; the communist\n(begin\n  (if (> mood 0.7) (println \"the revolution succeeds!\")\n    (if (< mood 0.3) (println \"the masses suffer\")\n      (println \"from each, to each\")))\n  (println \"we share the wealth\")\n  (+ (/ e 2) (/ oe 2)))",
+    // 13 – the communist (uses kernel: mix, status)
+    "; the communist\n(begin\n  (status)\n  (println \"from each, to each\")\n  (mix e oe 0.5))",
     // 14 – the thief
     "; the thief\n(begin\n  (if (> mood 0.7) (println \"the heist went perfectly!\")\n    (if (< mood 0.3) (println \"caught red-handed\")\n      (println \"eyeing the goods\")))\n  (if (> e oe) (println \"what is yours is mine\"))\n  (- e oe))",
     // 15 – the hunter
@@ -506,14 +569,14 @@ pub const SNIPPETS: &[&str] = &[
     "; the musician\n(begin\n  (if (> mood 0.7) (println \"standing ovation!\")\n    (if (< mood 0.3) (println \"out of tune...\")\n      (println \"playing my song\")))\n  (if (> (sin (* d 3)) 0) (println \"crescendo!\") (println \"soft passage\"))\n  (+ e (sin (* d 3))))",
     // 18 – the snake charmer
     "; the snake charmer\n(begin\n  (if (> mood 0.7) (println \"the serpent dances!\")\n    (if (< mood 0.3) (println \"the rhythm falters\")\n      (println \"hypnotic rhythm\")))\n  (if (> (* e d) 1) (println \"trance deepens\") (println \"swaying gently\"))\n  (tanh (* e d)))",
-    // 19 – the elder
-    "; the elder\n(begin\n  (if (> mood 0.7) (println \"these are golden years\")\n    (if (< mood 0.3) (println \"the world forgets us\")\n      (println \"wisdom comes slow\")))\n  (if (> age 100) (println \"I have seen much\") (println \"still learning\"))\n  (if (> age 100) oe e))",
+    // 19 – the elder (uses kernel: elder?, status, squash)
+    "; the elder\n(begin\n  (status)\n  (if (elder?) (println \"I have seen much\")\n    (println \"still learning\"))\n  (if (elder?) (squash oe) e))",
     // 20 – the explorer
     "; the explorer\n(begin\n  (if (> mood 0.7) (println \"what a discovery!\")\n    (if (< mood 0.3) (println \"hopelessly lost\")\n      (println \"mind the gap\")))\n  (if (> (abs (- e oe)) 0.5) (println \"vast difference here\") (println \"we are alike\"))\n  (* (abs (- e oe)) d))",
     // 21 – the scientist
     "; the scientist\n(let ((x (+ e d)))\n  (begin\n    (if (> mood 0.7) (println \"eureka!\")\n      (if (< mood 0.3) (println \"experiment failed\")\n        (println \"measuring...\")))\n    (println x)\n    (if (> x 1) (println \"above threshold\") (println \"below threshold\"))\n    (* x 0.3)))",
-    // 22 – the strategist
-    "; the strategist\n(begin\n  (if (> mood 0.7) (println \"checkmate!\")\n    (if (< mood 0.3) (println \"outmaneuvered...\")\n      (println \"calculating moves\")))\n  (cond\n    ((< d 1) (begin (println \"in striking range\") 3))\n    ((< d 3) (begin (println \"approaching target\") 1))\n    (#t (begin (println \"out of range, waiting\") -1))))",
+    // 22 – the strategist (uses kernel: approach-score, urgency)
+    "; the strategist\n(begin\n  (println (mood-word) \"calculating\")\n  (let ((score (approach-score))\n        (need (urgency)))\n    (println score need)\n    (+ score (* need 2))))",
     // 23 – the peacemaker
     "; the peacemaker\n(begin\n  (define x (+ e oe))\n  (if (> mood 0.7) (println \"harmony achieved!\")\n    (if (< mood 0.3) (println \"conflict everywhere\")\n      (println \"seeking harmony\")))\n  (if (> x 1) (println \"together we thrive\") (println \"we must conserve\"))\n  (/ x 2))",
 ];

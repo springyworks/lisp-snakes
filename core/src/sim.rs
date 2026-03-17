@@ -132,6 +132,8 @@ impl Sim {
         let x = rng.random_range(2..tw.saturating_sub(2).max(3) as i16);
         let y = rng.random_range(2..play_h.saturating_sub(2).max(3) as i16);
         let dir = Dir::from_index(rng.random_range(0..4_usize));
+        let mut env = lisp::Env::new();
+        lisp::boot_kernel(&mut env);
         LispSnake {
             alive: true,
             x,
@@ -140,7 +142,7 @@ impl Sim {
             energy: rng.random_range(0.7..1.0),
             body: vec![(x, y)],
             lisp_code: code,
-            lisp_env: lisp::Env::new(),
+            lisp_env: env,
             lisp_result: 0.0,
             mood: 0.5,
             print_buf: Vec::new(),
@@ -434,10 +436,12 @@ impl Sim {
 
         for (sx, sy, code, color) in spawn_queue {
             let dir = Dir::from_index(self.rng.random_range(0..4_usize));
+            let mut env = lisp::Env::new();
+            lisp::boot_kernel(&mut env);
             self.snakes.push(LispSnake {
                 alive: true, x: sx, y: sy, dir, energy: 0.9,
                 body: vec![(sx, sy)], lisp_code: code,
-                lisp_env: lisp::Env::new(), lisp_result: 0.0, mood: 0.5,
+                lisp_env: env, lisp_result: 0.0, mood: 0.5,
                 print_buf: Vec::new(), color_id: color, cooldown: SPAWN_COOLDOWN,
                 steps_to_turn: self.rng.random_range(3..10),
                 age: 0, meetings: 0, spawn_frame: cur_frame,
