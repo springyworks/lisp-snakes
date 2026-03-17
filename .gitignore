@@ -1,3 +1,5 @@
 /target
 /dist
+/terminal/target
 *.wasm
+*.bin
