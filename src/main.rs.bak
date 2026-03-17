@@ -1,0 +1,773 @@
+use anyhow::Result;
+use burn::tensor::{Distribution, Tensor};
+use burn_wgpu::{Wgpu, WgpuDevice};
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{poll, read, Event, KeyCode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, size as term_size, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
+use crossterm::{execute, queue};
+use rand::Rng;
+use std::f32::consts::TAU;
+use std::io::{stdout, Write};
+use std::thread;
+use std::time::{Duration, Instant};
+
+type B = Wgpu<f32, i32, u32>;
+
+const FEATURE_DIM: usize = 6;
+const OUTPUT_DIM: usize = 2;
+const INITIAL_WORMS: usize = 3;
+const MAX_WORMS: usize = 12;
+const SPAWN_DIST: i16 = 3;
+const SPAWN_COOLDOWN: u32 = 120;
+
+// ── word bank for sentence-worms ──────────────────────────────────────────────
+const WORDS: &[&str] = &[
+    "rust", "burn", "tensor", "wgpu", "learn", "pixel", "wave", "flux",
+    "glow", "spark", "drift", "morph", "pulse", "bloom", "crawl", "mesh",
+    "node", "sync", "deep", "code", "data", "fold", "spin", "fuse",
+    "link", "seed", "beam", "echo", "loop", "path", "flow", "grid",
+    "edge", "void", "core", "chip", "byte", "warp", "coil", "zinc",
+    "haze", "reef", "dawn", "dusk", "mist", "vine", "fern", "root",
+    "twig", "bark", "moss", "clay", "sand", "dust", "iron", "gold",
+    "ruby", "jade", "opal", "onyx", "silk", "wool", "hemp", "loom",
+    "riff", "drum", "bass", "harp", "reed", "bell", "horn", "chime",
+    "surf", "tide", "foam", "kelp", "crab", "gull", "hawk", "wren",
+];
+
+fn random_word(rng: &mut rand::rngs::ThreadRng) -> &'static str {
+    WORDS[rng.random_range(0..WORDS.len())]
+}
+
+fn make_sentence(rng: &mut rand::rngs::ThreadRng) -> String {
+    let n = rng.random_range(3..6);
+    let mut parts: Vec<&str> = Vec::with_capacity(n);
+    for _ in 0..n {
+        parts.push(random_word(rng));
+    }
+    parts.join("-")
+}
+
+fn combine_sentences(a: &str, b: &str, rng: &mut rand::rngs::ThreadRng) -> String {
+    let a_words: Vec<&str> = a.split('-').collect();
+    let b_words: Vec<&str> = b.split('-').collect();
+    let wa = a_words[rng.random_range(0..a_words.len())];
+    let wb = b_words[rng.random_range(0..b_words.len())];
+    let wc = random_word(rng);
+    format!("{wa}-{wb}-{wc}")
+}
+
+// ── 4 cardinal directions ─────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum Dir { Up, Down, Left, Right }
+
+impl Dir {
+    fn dx(self) -> i16 { match self { Dir::Left => -1, Dir::Right => 1, _ => 0 } }
+    fn dy(self) -> i16 { match self { Dir::Up => -1, Dir::Down => 1, _ => 0 } }
+    fn opposite(self) -> Dir {
+        match self { Dir::Up => Dir::Down, Dir::Down => Dir::Up,
+                     Dir::Left => Dir::Right, Dir::Right => Dir::Left }
+    }
+    fn head_char(self) -> char {
+        match self { Dir::Right => '>', Dir::Left => '<', Dir::Down => 'v', Dir::Up => '^' }
+    }
+    fn from_index(i: usize) -> Dir {
+        match i % 4 { 0 => Dir::Up, 1 => Dir::Down, 2 => Dir::Left, _ => Dir::Right }
+    }
+}
+
+struct StringWorm {
+    alive: bool,
+    x: i16,
+    y: i16,
+    dir: Dir,
+    energy: f32,
+    sentence: String,
+    body: Vec<(i16, i16)>,   // body segments in grid coords (head is body[0])
+    color_id: usize,
+    cooldown: u32,
+    steps_to_turn: u16,      // steps before next direction change
+}
+
+struct Sim {
+    term_w: usize,
+    term_h: usize,
+    worms: Vec<StringWorm>,
+    trail: Vec<f32>,          // high-res trail for learning/rendering background
+    learn_age: Vec<u16>,
+    rng: rand::rngs::ThreadRng,
+    next_color: usize,
+}
+
+struct OnlineLearner {
+    device: WgpuDevice,
+    w: Tensor<B, 2>,
+    last_loss: f32,
+    last_lr: f32,
+}
+
+impl OnlineLearner {
+    fn new(device: WgpuDevice) -> Self {
+        let w = Tensor::<B, 2>::random(
+            [FEATURE_DIM, OUTPUT_DIM],
+            Distribution::Normal(0.0, 0.12),
+            &device,
+        );
+        Self {
+            device,
+            w,
+            last_loss: 0.0,
+            last_lr: 0.0,
+        }
+    }
+
+    fn train_step(&mut self, x_cpu: &[f32], y_cpu: &[f32], batch: usize, lr: f32) {
+        let x = Tensor::<B, 1>::from_floats(x_cpu, &self.device).reshape([batch, FEATURE_DIM]);
+        let y = Tensor::<B, 1>::from_floats(y_cpu, &self.device).reshape([batch, OUTPUT_DIM]);
+
+        let pred = x.clone().matmul(self.w.clone());
+        let err = pred.sub(y);
+        let grad = x.transpose().matmul(err.clone()).div_scalar(batch as f32);
+        self.w = self.w.clone().sub(grad.mul_scalar(lr));
+
+        self.last_loss = err.powf_scalar(2.0).mean().into_scalar();
+        self.last_lr = lr;
+    }
+
+    fn weights_cpu(&self) -> Vec<f32> {
+        self.w.to_data().to_vec::<f32>().expect("weights f32")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Sim – classic unix worms on a terminal grid
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl Sim {
+    fn new(tw: usize, th: usize) -> Self {
+        let mut rng = rand::rng();
+        let play_h = th.saturating_sub(2); // leave room for HUD
+        let mut worms = Vec::with_capacity(INITIAL_WORMS);
+        for i in 0..INITIAL_WORMS {
+            worms.push(Self::make_worm(tw, play_h, i, &mut rng));
+        }
+        Self {
+            term_w: tw,
+            term_h: th,
+            worms,
+            trail: vec![0.0; tw * th],
+            learn_age: vec![1024; tw * th],
+            rng,
+            next_color: INITIAL_WORMS,
+        }
+    }
+
+    fn make_worm(tw: usize, play_h: usize, color: usize, rng: &mut rand::rngs::ThreadRng) -> StringWorm {
+        let sentence = make_sentence(rng);
+        let x = rng.random_range(2..tw.saturating_sub(2).max(3) as i16);
+        let y = rng.random_range(2..play_h.saturating_sub(2).max(3) as i16);
+        let dir = Dir::from_index(rng.random_range(0..4_usize));
+        StringWorm {
+            alive: true,
+            x, y, dir,
+            energy: rng.random_range(0.7..1.0),
+            body: vec![(x, y)],
+            sentence,
+            color_id: color,
+            cooldown: 0,
+            steps_to_turn: rng.random_range(3..12),
+        }
+    }
+
+    fn resize(&mut self, tw: usize, th: usize) {
+        self.term_w = tw;
+        self.term_h = th;
+        self.trail = vec![0.0; tw * th];
+        self.learn_age = vec![1024; tw * th];
+    }
+
+    fn wrap_x(&self, v: i16) -> i16 {
+        let w = self.term_w as i16;
+        ((v % w) + w) % w
+    }
+
+    fn wrap_y(&self, v: i16, play_h: usize) -> i16 {
+        let h = play_h as i16;
+        ((v % h) + h) % h
+    }
+
+    fn idx(&self, x: usize, y: usize) -> usize {
+        y * self.term_w + x
+    }
+
+    fn pick_direction(&mut self, wi: usize, weights: &[f32]) -> Dir {
+        let worm = &self.worms[wi];
+        let play_h = self.term_h.saturating_sub(2).max(1);
+
+        // Build features from worm state
+        let fx = worm.x as f32 / self.term_w.max(1) as f32;
+        let fy = worm.y as f32 / play_h.max(1) as f32;
+        let features = [
+            (fx * TAU).sin(),
+            (fy * TAU).cos(),
+            worm.dir.dx() as f32,
+            worm.dir.dy() as f32,
+            self.trail_at(worm.x as usize, worm.y as usize),
+            self.social_signal(wi),
+        ];
+
+        // Simple linear prediction
+        let mut pred_x: f32 = 0.0;
+        let mut pred_y: f32 = 0.0;
+        for f in 0..FEATURE_DIM {
+            pred_x += features[f] * weights[f * OUTPUT_DIM];
+            pred_y += features[f] * weights[f * OUTPUT_DIM + 1];
+        }
+
+        // Add randomness so worms don't get stuck
+        pred_x += self.rng.random_range(-0.3..0.3);
+        pred_y += self.rng.random_range(-0.3..0.3);
+
+        // Pick the strongest axis, avoiding 180° reversal
+        let cur = worm.dir;
+        let candidate = if pred_x.abs() > pred_y.abs() {
+            if pred_x > 0.0 { Dir::Right } else { Dir::Left }
+        } else {
+            if pred_y > 0.0 { Dir::Down } else { Dir::Up }
+        };
+
+        if candidate == cur.opposite() {
+            // Don't reverse into ourselves; pick a perpendicular direction
+            match cur {
+                Dir::Up | Dir::Down => if pred_x > 0.0 { Dir::Right } else { Dir::Left },
+                Dir::Left | Dir::Right => if pred_y > 0.0 { Dir::Down } else { Dir::Up },
+            }
+        } else {
+            candidate
+        }
+    }
+
+    fn trail_at(&self, x: usize, y: usize) -> f32 {
+        if x < self.term_w && y < self.term_h {
+            self.trail[self.idx(x, y)]
+        } else {
+            0.0
+        }
+    }
+
+    fn social_signal(&self, wi: usize) -> f32 {
+        let worm = &self.worms[wi];
+        let mut sig: f32 = 0.0;
+        for (j, other) in self.worms.iter().enumerate() {
+            if j == wi || !other.alive { continue; }
+            let dx = (other.x - worm.x) as f32;
+            let dy = (other.y - worm.y) as f32;
+            let d2 = dx * dx + dy * dy + 1.0;
+            sig += (1.0 / d2).min(0.5);
+        }
+        sig
+    }
+
+    fn interaction_vector(&self, i: usize) -> (f32, f32, f32) {
+        let wi = &self.worms[i];
+        let mut ax: f32 = 0.0;
+        let mut ay: f32 = 0.0;
+        let mut social: f32 = 0.0;
+        for (j, wj) in self.worms.iter().enumerate() {
+            if i == j || !wj.alive { continue; }
+            let dx = (wj.x - wi.x) as f32;
+            let dy = (wj.y - wi.y) as f32;
+            let d2 = dx * dx + dy * dy + 0.1;
+            if d2 < 20.0 { ax -= dx / d2; ay -= dy / d2; }
+            else if d2 < 400.0 { ax += dx / d2; ay += dy / d2; }
+            social += (1.0 / d2).min(0.5);
+        }
+        (ax, ay, social)
+    }
+
+    fn sample_batch(&mut self, batch: usize) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+        let mut x = vec![0.0; batch * FEATURE_DIM];
+        let mut y = vec![0.0; batch * OUTPUT_DIM];
+        let mut marks = Vec::with_capacity(batch);
+        let play_h = self.term_h.saturating_sub(2).max(1);
+
+        for b in 0..batch {
+            let mut idx = self.rng.random_range(0..self.worms.len().max(1));
+            for _ in 0..8 {
+                if idx < self.worms.len() && self.worms[idx].alive { break; }
+                idx = self.rng.random_range(0..self.worms.len().max(1));
+            }
+            if idx >= self.worms.len() { continue; }
+            let w = &self.worms[idx];
+            let (ax, ay, social) = self.interaction_vector(idx);
+            let cell = self.idx(
+                (w.x as usize).min(self.term_w.saturating_sub(1)),
+                (w.y as usize).min(self.term_h.saturating_sub(1)),
+            );
+            let local = if cell < self.trail.len() { self.trail[cell] } else { 0.0 };
+
+            let row_x = b * FEATURE_DIM;
+            x[row_x]     = (w.x as f32 / self.term_w.max(1) as f32 * TAU).sin();
+            x[row_x + 1] = (w.y as f32 / play_h.max(1) as f32 * TAU).cos();
+            x[row_x + 2] = w.dir.dx() as f32;
+            x[row_x + 3] = w.dir.dy() as f32;
+            x[row_x + 4] = local;
+            x[row_x + 5] = social;
+
+            let row_y = b * OUTPUT_DIM;
+            y[row_y]     = (ax + 0.2 * (w.y as f32 * 0.07).sin()).tanh();
+            y[row_y + 1] = (ay + 0.2 * (w.x as f32 * 0.06).cos()).tanh();
+            marks.push(cell);
+        }
+        (x, y, marks)
+    }
+
+    /// Advance all worms one step on the grid – classic snake logic
+    fn step(&mut self, weights: &[f32]) {
+        let play_h = self.term_h.saturating_sub(2).max(1);
+
+        // Decay trail
+        for t in &mut self.trail { *t *= 0.992; }
+        for age in &mut self.learn_age { *age = age.saturating_add(1).min(1024); }
+
+        let n = self.worms.len();
+        for i in 0..n {
+            if !self.worms[i].alive { continue; }
+            self.worms[i].cooldown = self.worms[i].cooldown.saturating_sub(1);
+
+            // Decide whether to turn
+            if self.worms[i].steps_to_turn == 0 {
+                let new_dir = self.pick_direction(i, weights);
+                self.worms[i].dir = new_dir;
+                self.worms[i].steps_to_turn = self.rng.random_range(4..15);
+            } else {
+                self.worms[i].steps_to_turn -= 1;
+            }
+
+            let dir = self.worms[i].dir;
+            let new_x = self.wrap_x(self.worms[i].x + dir.dx());
+            let new_y = self.wrap_y(self.worms[i].y + dir.dy(), play_h);
+
+            // Advance body: push new head position, trim to sentence length
+            self.worms[i].body.insert(0, (new_x, new_y));
+            let max_len = self.worms[i].sentence.len();
+            while self.worms[i].body.len() > max_len {
+                self.worms[i].body.pop();
+            }
+
+            self.worms[i].x = new_x;
+            self.worms[i].y = new_y;
+
+            // Leave trail on the grid
+            let tx = (new_x as usize).min(self.term_w.saturating_sub(1));
+            let ty = (new_y as usize).min(self.term_h.saturating_sub(1));
+            let cell = self.idx(tx, ty);
+            if cell < self.trail.len() {
+                self.trail[cell] = (self.trail[cell] + 0.4).min(2.0);
+            }
+
+            // Energy slowly depletes
+            self.worms[i].energy -= 0.002;
+            if self.worms[i].energy < 0.05 {
+                self.worms[i].alive = false;
+            }
+        }
+
+        // ── spawning: when two worm heads are close ───────────────────────────
+        let alive_count = self.worms.iter().filter(|w| w.alive).count();
+        if alive_count < MAX_WORMS {
+            let mut spawn: Option<(i16, i16, String, usize)> = None;
+            'outer: for i in 0..n {
+                if !self.worms[i].alive || self.worms[i].cooldown > 0 { continue; }
+                for j in (i+1)..n {
+                    if !self.worms[j].alive || self.worms[j].cooldown > 0 { continue; }
+                    let dx = (self.worms[i].x - self.worms[j].x).abs();
+                    let dy = (self.worms[i].y - self.worms[j].y).abs();
+                    if dx <= SPAWN_DIST && dy <= SPAWN_DIST {
+                        let sx = (self.worms[i].x + self.worms[j].x) / 2;
+                        let sy = (self.worms[i].y + self.worms[j].y) / 2;
+                        let sentence = combine_sentences(
+                            &self.worms[i].sentence,
+                            &self.worms[j].sentence,
+                            &mut self.rng,
+                        );
+                        let color = self.next_color;
+                        self.worms[i].cooldown = SPAWN_COOLDOWN;
+                        self.worms[j].cooldown = SPAWN_COOLDOWN;
+                        spawn = Some((sx, sy, sentence, color));
+                        break 'outer;
+                    }
+                }
+            }
+            if let Some((sx, sy, sentence, color)) = spawn {
+                self.next_color += 1;
+                let dir = Dir::from_index(self.rng.random_range(0..4_usize));
+                self.worms.push(StringWorm {
+                    alive: true,
+                    x: sx, y: sy, dir,
+                    energy: 0.9,
+                    body: vec![(sx, sy)],
+                    sentence,
+                    color_id: color,
+                    cooldown: SPAWN_COOLDOWN,
+                    steps_to_turn: self.rng.random_range(3..10),
+                });
+            }
+        }
+
+        // ── respawn if too few alive ──────────────────────────────────────────
+        let alive_count = self.worms.iter().filter(|w| w.alive).count();
+        if alive_count < 2 {
+            let color = self.next_color;
+            self.next_color += 1;
+            self.worms.push(Self::make_worm(self.term_w, play_h, color, &mut self.rng));
+        }
+
+        // Clean up dead worms that have been dead a while (body empty)
+        self.worms.retain(|w| w.alive || !w.body.is_empty());
+        // Shrink dead worm bodies so they fade
+        for w in &mut self.worms {
+            if !w.alive && !w.body.is_empty() {
+                w.body.pop();
+            }
+        }
+    }
+
+    fn mark_learning_cells(&mut self, marks: &[usize]) {
+        for &cell in marks {
+            if cell < self.learn_age.len() {
+                self.learn_age[cell] = 0;
+            }
+        }
+    }
+
+    fn alive_count(&self) -> usize {
+        self.worms.iter().filter(|w| w.alive).count()
+    }
+
+    fn render(&self, out: &mut String, hud: &str) {
+        let tw = self.term_w;
+        let th = self.term_h;
+        let play_h = th.saturating_sub(2);
+
+        // Build overlay: (char, color_id, is_head) per cell
+        let cells = tw * play_h;
+        let mut overlay: Vec<Option<(char, usize, bool)>> = vec![None; cells];
+
+        for worm in &self.worms {
+            if worm.body.is_empty() { continue; }
+            let chars: Vec<char> = worm.sentence.chars().collect();
+            for (seg, &(bx, by)) in worm.body.iter().enumerate() {
+                let ux = bx as usize;
+                let uy = by as usize;
+                if ux < tw && uy < play_h {
+                    let oi = uy * tw + ux;
+                    let ch = if seg == 0 {
+                        worm.dir.head_char()
+                    } else if seg < chars.len() {
+                        chars[seg]
+                    } else {
+                        '~'
+                    };
+                    overlay[oi] = Some((ch, worm.color_id, seg == 0));
+                }
+            }
+        }
+
+        out.clear();
+        out.push_str("\x1b[H"); // cursor home
+        // HUD line
+        out.push_str("\x1b[1;37;40m");
+        let hud_display: String = hud.chars().take(tw).collect();
+        out.push_str(&hud_display);
+        // Pad rest of HUD line
+        for _ in hud_display.len()..tw { out.push(' '); }
+        out.push_str("\x1b[0m\n");
+
+        // Separator
+        for _ in 0..tw { out.push('─'); }
+        out.push('\n');
+
+        // Play area
+        for ty in 0..play_h {
+            for tx in 0..tw {
+                let oi = ty * tw + tx;
+                if let Some((ch, color_id, is_head)) = overlay[oi] {
+                    let (r, g, b) = worm_color(color_id);
+                    if is_head {
+                        // Bright head with background highlight
+                        push_rgb_bg(out, 255, 255, 255, r, g, b);
+                        out.push(ch);
+                        out.push_str("\x1b[0m");
+                    } else {
+                        // Body character in worm color
+                        let fade = if !self.worms.iter().any(|w| w.color_id == color_id && w.alive) {
+                            0.4 // fading dead worm
+                        } else {
+                            1.0
+                        };
+                        push_rgb_fg(out, (r as f32 * fade) as u8,
+                                         (g as f32 * fade) as u8,
+                                         (b as f32 * fade) as u8);
+                        out.push(ch);
+                    }
+                } else {
+                    // Background: trail chars
+                    let cell = self.idx(tx, ty);
+                    let density = if cell < self.trail.len() { self.trail[cell] } else { 0.0 };
+                    let age = if cell < self.learn_age.len() { self.learn_age[cell] as f32 } else { 1024.0 };
+
+                    let norm = (density / 2.0).clamp(0.0, 1.0);
+                    let aa = smoothstep(0.03, 0.85, norm);
+
+                    const TRAIL_CHARS: &[u8] = b" .,:;+*#";
+                    let gi = (aa * (TRAIL_CHARS.len() as f32 - 1.0)).round() as usize;
+                    let ch = TRAIL_CHARS[gi.min(TRAIL_CHARS.len() - 1)] as char;
+
+                    if ch == ' ' {
+                        out.push(' ');
+                    } else {
+                        let (r, g, b) = color_from_density_age(aa, age);
+                        push_rgb_fg(out, r, g, b);
+                        out.push(ch);
+                    }
+                }
+            }
+            out.push_str("\x1b[0m\r\n");
+        }
+    }
+}
+
+// ── color helpers ─────────────────────────────────────────────────────────────
+
+fn push_rgb_fg(out: &mut String, r: u8, g: u8, b: u8) {
+    out.push_str("\x1b[38;2;");
+    out.push_str(&r.to_string()); out.push(';');
+    out.push_str(&g.to_string()); out.push(';');
+    out.push_str(&b.to_string()); out.push('m');
+}
+
+fn push_rgb_bg(out: &mut String, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8) {
+    out.push_str("\x1b[1;38;2;");
+    out.push_str(&fg_r.to_string()); out.push(';');
+    out.push_str(&fg_g.to_string()); out.push(';');
+    out.push_str(&fg_b.to_string());
+    out.push_str(";48;2;");
+    out.push_str(&bg_r.to_string()); out.push(';');
+    out.push_str(&bg_g.to_string()); out.push(';');
+    out.push_str(&bg_b.to_string()); out.push('m');
+}
+
+fn worm_color(id: usize) -> (u8, u8, u8) {
+    const PALETTE: [(u8, u8, u8); 12] = [
+        (255, 80, 80),   (80, 255, 80),  (80, 180, 255),
+        (255, 200, 50),  (200, 100, 255),(50, 255, 200),
+        (255, 140, 60),  (180, 255, 80), (255, 80, 200),
+        (100, 200, 255), (255, 255, 100),(150, 255, 150),
+    ];
+    PALETTE[id % PALETTE.len()]
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn color_from_density_age(density: f32, age: f32) -> (u8, u8, u8) {
+    let t_recent = (1.0 - age / 320.0).clamp(0.0, 1.0);
+    let t_old = (age / 1024.0).clamp(0.0, 1.0);
+    let r = (30.0 + 100.0 * density + 60.0 * t_recent - 20.0 * t_old).clamp(0.0, 255.0) as u8;
+    let g = (40.0 + 120.0 * density + 30.0 * t_recent + 15.0 * t_old).clamp(0.0, 255.0) as u8;
+    let b = (20.0 + 60.0 * density + 10.0 * t_recent + 60.0 * t_old).clamp(0.0, 255.0) as u8;
+    (r, g, b)
+}
+
+// ── terminal guard ────────────────────────────────────────────────────────────
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen, Hide, MoveTo(0, 0))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+fn parse_arg<T: std::str::FromStr>(name: &str, default: T) -> T {
+    let key = format!("--{name}=");
+    std::env::args()
+        .find_map(|a| a.strip_prefix(&key).and_then(|v| v.parse::<T>().ok()))
+        .unwrap_or(default)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  main – classic unix worms + GPU learning loop
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn render_help_overlay(out: &mut String, tw: usize, th: usize) {
+    let lines = [
+        "╔══════════════════════════════════════════╗",
+        "║        KEYBOARD CONTROLS  [?/h]         ║",
+        "╠══════════════════════════════════════════╣",
+        "║  SPACE   Pause / Resume                 ║",
+        "║  +/=     Speed up  (increase FPS)        ║",
+        "║  -       Slow down (decrease FPS)        ║",
+        "║  s       Spawn a new worm                ║",
+        "║  k       Kill oldest worm                ║",
+        "║  c       Clear trails                    ║",
+        "║  r       Reset simulation                ║",
+        "║  l       Toggle learning on/off           ║",
+        "║  t       Cycle trail style                ║",
+        "║  ?/h     Toggle this help overlay         ║",
+        "║  q/Esc   Quit                            ║",
+        "╚══════════════════════════════════════════╝",
+    ];
+    let box_w = lines[0].chars().count();
+    let box_h = lines.len();
+    let ox = tw.saturating_sub(box_w) / 2;
+    let oy = th.saturating_sub(box_h) / 2;
+
+    for (i, line) in lines.iter().enumerate() {
+        let y = oy + i;
+        if y >= th { break; }
+        out.push_str(&format!("\x1b[{};{}H", y + 1, ox + 1));
+        out.push_str("\x1b[1;37;44m");
+        out.push_str(line);
+        out.push_str("\x1b[0m");
+    }
+}
+
+fn main() -> Result<()> {
+    let initial_fps = parse_arg("fps", 8_u64).max(2);
+    let learn_steps = parse_arg("learn_steps", 12_usize).max(1);
+    let batch_size = parse_arg("batch", 128_usize).clamp(16, 1024);
+
+    let mut fps = initial_fps;
+    let mut frame_time = Duration::from_micros(1_000_000 / fps);
+    let mut paused = false;
+    let mut show_help = true; // show help on start, dismiss on any key
+    let mut learning_enabled = true;
+    let mut trail_style: u8 = 0; // 0=default, 1=dots, 2=blocks
+
+    let _guard = TerminalGuard::new()?;
+
+    let (w, h) = term_size()?;
+    let mut tw = w as usize;
+    let mut th = h as usize;
+    let mut sim = Sim::new(tw, th);
+    let device = WgpuDevice::default();
+    let mut learner = OnlineLearner::new(device);
+
+    let mut out = String::with_capacity((tw + 32) * th);
+    let mut frame = 0_u64;
+    let start = Instant::now();
+
+    loop {
+        let frame_start = Instant::now();
+
+        // ── handle input & resize ─────────────────────────────────────────
+        while poll(Duration::from_millis(0))? {
+            match read()? {
+                Event::Key(k) => match k.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char(' ') => paused = !paused,
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        fps = (fps + 2).min(60);
+                        frame_time = Duration::from_micros(1_000_000 / fps);
+                    }
+                    KeyCode::Char('-') => {
+                        fps = (fps.saturating_sub(2)).max(2);
+                        frame_time = Duration::from_micros(1_000_000 / fps);
+                    }
+                    KeyCode::Char('s') => {
+                        let play_h = th.saturating_sub(2).max(1);
+                        let color = sim.next_color;
+                        sim.next_color += 1;
+                        sim.worms.push(Sim::make_worm(tw, play_h, color, &mut sim.rng));
+                    }
+                    KeyCode::Char('k') => {
+                        if let Some(w) = sim.worms.iter_mut().find(|w| w.alive) {
+                            w.alive = false;
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        sim.trail.fill(0.0);
+                        sim.learn_age.fill(1024);
+                    }
+                    KeyCode::Char('r') => {
+                        sim = Sim::new(tw, th);
+                        let device2 = WgpuDevice::default();
+                        learner = OnlineLearner::new(device2);
+                        frame = 0;
+                    }
+                    KeyCode::Char('l') => learning_enabled = !learning_enabled,
+                    KeyCode::Char('t') => trail_style = (trail_style + 1) % 3,
+                    KeyCode::Char('?') | KeyCode::Char('h') => show_help = !show_help,
+                    _ => {}
+                },
+                Event::Resize(nw, nh) => {
+                    tw = nw as usize;
+                    th = nh as usize;
+                    sim.resize(tw, th);
+                    let _ = execute!(stdout(), MoveTo(0, 0));
+                }
+                _ => {}
+            }
+        }
+
+        if !paused {
+            // ── GPU learning ──────────────────────────────────────────────────
+            if learning_enabled {
+                for _ in 0..learn_steps {
+                    let (x, y, marks) = sim.sample_batch(batch_size);
+                    let lr = 0.015 * (1.0 / (1.0 + frame as f32 * 0.00005));
+                    learner.train_step(&x, &y, batch_size, lr);
+                    sim.mark_learning_cells(&marks);
+                }
+            }
+
+            // ── step worms on grid ────────────────────────────────────────────
+            let weights = learner.weights_cpu();
+            sim.step(&weights);
+
+            frame += 1;
+        }
+
+        // ── render ────────────────────────────────────────────────────────
+        let elapsed = start.elapsed().as_secs_f32();
+        let alive = sim.alive_count();
+        let total = sim.worms.len();
+        let pause_tag = if paused { " ⏸ PAUSED" } else { "" };
+        let learn_tag = if learning_enabled { "" } else { " learn:OFF" };
+        let hud = format!(
+            " worms:{alive}/{total}  fps:{fps}  frame:{frame}  loss:{:.4}  t:{elapsed:.0}s{pause_tag}{learn_tag}  [?]help [q]uit",
+            learner.last_loss,
+        );
+
+        sim.render(&mut out, &hud);
+
+        if show_help {
+            render_help_overlay(&mut out, tw, th);
+        }
+
+        let mut term = stdout();
+        queue!(term, MoveTo(0, 0))?;
+        term.write_all(out.as_bytes())?;
+        term.flush()?;
+
+        let spent = frame_start.elapsed();
+        if spent < frame_time {
+            thread::sleep(frame_time - spent);
+        }
+    }
+}

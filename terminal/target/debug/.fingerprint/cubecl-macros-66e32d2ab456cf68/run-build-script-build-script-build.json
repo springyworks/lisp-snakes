@@ -1,0 +1,1 @@
+{"rustc":4384440275996659375,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[5404698187090042549,"build_script_build",false,5388546886848123793],[9423015880379144908,"build_script_build",false,11560459107472293134]],"local":[{"RerunIfEnvChanged":{"var":"CUBECL_DEBUG","val":null}}],"rustflags":[],"config":0,"compile_kind":0}

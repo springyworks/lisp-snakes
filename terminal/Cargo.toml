@@ -1,0 +1,16 @@
+[package]
+name = "lisp-snakes-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "lisp-snakes"
+path = "src/main.rs"
+
+[dependencies]
+lisp-snakes-core = { path = "../core" }
+anyhow = "1.0"
+burn = { path = "../../burn/crates/burn", features = ["wgpu", "std", "fusion"] }
+burn-wgpu = { path = "../../burn/crates/burn-wgpu" }
+crossterm = "0.29"
+rand = "0.9"
